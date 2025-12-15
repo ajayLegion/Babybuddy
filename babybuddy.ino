@@ -1,156 +1,164 @@
-/*
-   BabyBuddy AI Health Monitor (ESP32)
-   Sensors:
-   - MAX30102 (AdvancedOximeter) → HR & SpO2
-   - SW420 → Vibration detection
-   - Doppler Sensor → Breathing / Motion
-   - OLED Display (SSD1306 0.96")
-   - Neopixel LED + Buzzer
-   - AI Mood Detection (TinyML-style)
-   - MATLAB serial output
-*/
-
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <Adafruit_NeoPixel.h>
-#include <AdvancedOximeter.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include "MAX30105.h"
+#include "heartRate.h"
 
-// ---------- Pin Setup ----------
-#define OLED_SDA 21
-#define OLED_SCL 22
-#define OLED_ADDR 0x3C
-#define NEOPIXEL_PIN 4
-#define BUZZER_PIN 15
-#define SW420_PIN 34
-#define DOPPLER_PIN 35
-#define BUTTON_PIN 27
-
-// ---------- Display ----------
+// -------------------- OLED --------------------
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-// ---------- LED ----------
-Adafruit_NeoPixel pixels(1, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
+// -------------------- Sensors --------------------
+Adafruit_MPU6050 mpu;
+MAX30105 particleSensor;
 
-// ---------- Sensors ----------
-AdvancedOximeter max30102;
+// -------------------- Pins --------------------
+#define SW420_PIN 14   // Kick sensor
 
-// ---------- Variables ----------
-float hr = 0, spo2 = 0;
-int vibration = 0;
-float dopplerVal = 0;
-bool matlabMode = false;
+// -------------------- Variables --------------------
+int babyHR = 0;        // From MATLAB
+int motherHR = 0;
+bool kickDetected = false;
+String motionState = "STABLE";
 
-// ---------- Simple AI Mood Function ----------
-String detectMood(float hr, float doppler, int vib) {
-  if (hr > 120 && doppler > 2000) return "Anxious ";
-  if (hr < 60 && doppler < 800) return "Calm ";
-  if (vib == 1) return "Disturbed ";
-  return "Normal ";
-}
+// MAX30102 variables
+const byte RATE_SIZE = 4;
+byte rates[RATE_SIZE];
+byte rateSpot = 0;
+long lastBeat = 0;
 
-// ---------- OLED Helper Function ----------
-void showText(int x, int y, String text) {
-  display.setCursor(x, y);
-  display.println(text);
-}
-
-// ---------- Setup ----------
+// -------------------- SETUP --------------------
 void setup() {
   Serial.begin(115200);
-  Wire.begin(OLED_SDA, OLED_SCL);
-
   pinMode(SW420_PIN, INPUT);
-  pinMode(BUZZER_PIN, OUTPUT);
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-  pinMode(DOPPLER_PIN, INPUT);
 
-  pixels.begin();
-  pixels.clear();
-  pixels.show();
+  Wire.begin();
 
-  // OLED Initialization
-  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
-    Serial.println("OLED not detected!");
+  // OLED init
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED failed");
     while (1);
   }
   display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(10, 24);
-  display.println("BabyBuddy Initializing...");
-  display.display();
 
-  // MAX30102 Initialization
-  if (!max30102.begin()) {
-    Serial.println("MAX30102 not found!");
-    display.clearDisplay();
-    display.setCursor(10, 24);
-    display.println("MAX30102 Not Found!");
-    display.display();
+  // MPU6050 init
+  if (!mpu.begin()) {
+    Serial.println("MPU6050 not found");
+    while (1);
+  }
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+  // MAX30102 init
+  if (!particleSensor.begin(Wire, I2C_SPEED_STANDARD)) {
+    Serial.println("MAX30102 not found");
     while (1);
   }
 
+  particleSensor.setup(); // default settings
+  particleSensor.setPulseAmplitudeRed(0x0A);
+  particleSensor.setPulseAmplitudeGreen(0);
+
+  displayMessage("System Ready");
   delay(1500);
-  display.clearDisplay();
-  display.setCursor(20, 24);
-  display.println("BabyBuddy Ready!");
-  display.display();
-  delay(1000);
 }
 
-// ---------- Loop ----------
+// -------------------- LOOP --------------------
 void loop() {
-  // Button toggle for MATLAB mode
-  if (digitalRead(BUTTON_PIN) == LOW) {
-    matlabMode = !matlabMode;
-    delay(400);  // debounce
+  readBabyHRFromMATLAB();
+  readMotherHR();
+  detectKick();
+  detectMotion();
+  updateOLED();
+  delay(300);
+}
+
+// -------------------- FUNCTIONS --------------------
+
+// Read Baby HR from MATLAB via Serial
+void readBabyHRFromMATLAB() {
+  if (Serial.available()) {
+    babyHR = Serial.parseInt();
+    while (Serial.available()) Serial.read(); // clear buffer
   }
+}
 
-  // Read all sensors
-  vibration = digitalRead(SW420_PIN);
-  dopplerVal = analogRead(DOPPLER_PIN);
-  max30102.update();
-  hr = max30102.getHeartRate();
-  spo2 = max30102.getSpO2();
+// Mother HR from MAX30102
+void readMotherHR() {
+  long irValue = particleSensor.getIR();
 
-  // AI Mood detection
-  String mood = detectMood(hr, dopplerVal, vibration);
+  if (checkForBeat(irValue)) {
+    long delta = millis() - lastBeat;
+    lastBeat = millis();
 
-  // ---------- OLED Display Update ----------
+    float bpm = 60 / (delta / 1000.0);
+
+    if (bpm > 40 && bpm < 180) {
+      rates[rateSpot++] = (byte)bpm;
+      rateSpot %= RATE_SIZE;
+
+      motherHR = 0;
+      for (byte i = 0; i < RATE_SIZE; i++) {
+        motherHR += rates[i];
+      }
+      motherHR /= RATE_SIZE;
+    }
+  }
+}
+
+// Kick detection using SW-420
+void detectKick() {
+  kickDetected = digitalRead(SW420_PIN);
+}
+
+// Motion detection using MPU6050
+void detectMotion() {
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  float accMag = sqrt(
+    a.acceleration.x * a.acceleration.x +
+    a.acceleration.y * a.acceleration.y +
+    a.acceleration.z * a.acceleration.z
+  );
+
+  if (accMag > 12.5) motionState = "ACTIVE";
+  else motionState = "STABLE";
+}
+
+// OLED update
+void updateOLED() {
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
 
-  showText(0, 0, matlabMode ? "MATLAB MODE" : "NORMAL MODE");
-  showText(0, 14, "HR: " + String(hr, 1) + " bpm");
-  showText(0, 26, "SpO2: " + String(spo2, 1) + " %");
-  showText(0, 38, "Doppler: " + String(dopplerVal, 0));
-  showText(0, 50, "Vib: " + String(vibration) + " Mood: " + mood);
+  display.setCursor(0, 0);
+  display.print("Baby HR   : ");
+  display.print(babyHR);
+  display.println(" bpm");
+
+  display.print("Mother HR : ");
+  display.print(motherHR);
+  display.println(" bpm");
+
+  display.print("Kick      : ");
+  display.println(kickDetected ? "YES" : "NO");
+
+  display.print("Motion    : ");
+  display.println(motionState);
+
   display.display();
+}
 
-  // ---------- LED & Buzzer Alerts ----------
-  if (hr > 130 || hr < 50 || vibration == 1) {
-    pixels.setPixelColor(0, pixels.Color(255, 0, 0));  // Red alert
-    pixels.show();
-    tone(BUZZER_PIN, 1000, 200);
-  } else {
-    pixels.setPixelColor(0, pixels.Color(0, 255, 0));  // Green safe
-    pixels.show();
-    noTone(BUZZER_PIN);
-  }
-
-  // ---------- MATLAB Serial Output ----------
-  if (matlabMode) {
-    // Send CSV line for MATLAB
-    Serial.print(hr); Serial.print(",");
-    Serial.print(spo2); Serial.print(",");
-    Serial.print(dopplerVal); Serial.print(",");
-    Serial.print(vibration); Serial.print(",");
-    Serial.println(mood);  // newline guarantees readline() works
-  }
-
-  delay(300);
+// Display startup message
+void displayMessage(String msg) {
+  display.clearDisplay();
+  display.setCursor(0, 20);
+  display.setTextSize(1);
+  display.println(msg);
+  display.display();
 }
