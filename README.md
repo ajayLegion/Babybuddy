@@ -1,4 +1,5 @@
 #  BabyBuddy – TinyML Based Baby Monitoring System
+[](babybuddy.jpg)
 
 ## 📌 Project Overview
 
